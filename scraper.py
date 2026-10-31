@@ -20,18 +20,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
-
-GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.8-flash-lite",
-]
+GEMINI_MODEL = "gemini-3.8-flash"
 
 if not GEMINI_API_KEY:
-    raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets alebo v prostredí.")
+    raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets.")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=30000),
+)
 
 
+# ==========================================
+# POMOCNÉ FUNKCIE PRE SÚBORY A CENY
+# ==========================================
 def load_watchlist() -> list[str]:
     if not os.path.exists(WATCHLIST_FILE):
         print(f"Upozornenie: Súbor {WATCHLIST_FILE} neexistuje!")
@@ -88,78 +90,40 @@ def parse_euro_price(raw_text: str) -> float | None:
         return None
 
 
-def call_gemini_json(prompt: str) -> list | dict | None:
+def build_search_queries(item: str) -> list[str]:
     """
-    Zavolá priamo Gemini REST API s prísnym 20-sekundovým timeoutom,
-    aby sa knižnica pri 503 nikdy nezasekla v nekonečnom čakaní.
+    Lokálne (bez míňania Gemini API limitu!) vytvorí z položky vo watchlist.txt
+    vyhľadávacie výrazy vrátane širšieho výrazu bez označení ako MK II, 65, '65,
+    aby vyhľadávače našli aj inzeráty, kde predávajúci tieto detaily nenapísal.
     """
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.1,
-        },
-    }
-    for model_name in GEMINI_MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            r = requests.post(url, json=payload, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text)
-            else:
-                print(f" -> [Gemini {model_name} HTTP {r.status_code}]: {r.text[:180]}", flush=True)
-        except Exception as e:
-            print(f" -> [Gemini {model_name} nedostupný]: {e}", flush=True)
-        time.sleep(2)
-    return None
-
-
-def build_smart_fallback_queries(item: str) -> list[str]:
     base = re.sub(r"\(.*?\)", "", item).strip()
-    queries = [base]
-    simplified = re.sub(r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2})\b", "", base, flags=re.IGNORECASE)
+    queries = []
+
+    # Skrátený výraz bez "MK II", "MK 2", ročníkov "65", "1966" atď.
+    simplified = re.sub(
+        r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2}|19\d{2}|reissue)\b",
+        "",
+        base,
+        flags=re.IGNORECASE,
+    )
     simplified = re.sub(r"\s+", " ", simplified).strip(" -")
-    if simplified and simplified.lower() != base.lower() and len(simplified) >= 3:
+
+    if simplified and len(simplified) >= 3:
         queries.append(simplified)
+    if base not in queries:
+        queries.append(base)
+
+    # Ak názov obsahuje pomlčku (napr. DDJ-400), pridáme aj verziu s medzerou
     if "-" in base:
-        no_dash = base.replace("-", " ")
-        no_dash = re.sub(r"\s+", " ", no_dash).strip()
+        no_dash = re.sub(r"\s+", " ", base.replace("-", " ")).strip()
         if no_dash not in queries:
             queries.append(no_dash)
-    return queries[:3]
+
+    return queries[:2]
 
 
 # ==========================================
-# 1. AI GENEROVANIE HĽADACÍCH VÝRAZOV (AJ S PREKLEPMI)
-# ==========================================
-def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
-    prompt = f"""
-    Mám zoznam položiek, ktoré hľadám na inzertných portáloch Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com:
-    {json.dumps(watchlist, ensure_ascii=False)}
-
-    Pre každú položku zo vstupného zoznamu vygeneruj JSON pole objektov s týmito poľami:
-    - "target_item": pôvodný text položky zo zoznamu
-    - "queries": pole 2 až 3 krátkych kľúčových výrazov (2-3 najdôležitejšie slová, od špecifického po širší základný model bez zbytočných prívlastkov ako MK II alebo 65), ktoré najlepšie nájdu túto položku vo vyhľadávači.
-    Vráť čisto JSON pole.
-    """
-    parsed = call_gemini_json(prompt)
-    if isinstance(parsed, list) and parsed:
-        for entry in parsed:
-            t_item = entry.get("target_item", "")
-            q_list = entry.get("queries", [])
-            for fb_q in build_smart_fallback_queries(t_item):
-                if fb_q not in q_list and len(q_list) < 3:
-                    q_list.append(fb_q)
-        return parsed
-
-    print(" -> Používam lokálne generovanie vyhľadávacích výrazov (záložný režim).", flush=True)
-    return [{"target_item": item, "queries": build_smart_fallback_queries(item)} for item in watchlist]
-
-
-# ==========================================
-# 2. SŤAHOVANIE BAZOŠ.SK
+# 1. SŤAHOVANIE BAZOŠ.SK
 # ==========================================
 def parse_bazos_rss_xml(xml_text: str, target_item: str) -> list[dict]:
     ads = []
@@ -258,7 +222,7 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 3. SŤAHOVANIE KLEINANZEIGEN.DE
+# 2. SŤAHOVANIE KLEINANZEIGEN.DE
 # ==========================================
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
@@ -335,7 +299,7 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 4. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
+# 3. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
 # ==========================================
 def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
@@ -377,12 +341,13 @@ def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
             "portal": "MercatinoMusicale.com",
             "target_item": target_item,
             "title": title,
-            "description": desc,
+            "description": desc[:250],
             "price": price,
             "price_text": price_text,
             "url": link,
         })
-    return ads
+    # Zoberieme prvých 20 najnovších inzerátov na jeden výraz
+    return ads[:20]
 
 
 def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
@@ -402,92 +367,63 @@ def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 5. HROMADNÁ AI ANALÝZA INZERÁTOV (GEMINI + ZÁLOŽNÝ FILTER)
+# 4. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE AKO V PÔVODNOM KÓDE)
 # ==========================================
-def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
-    """
-    Záložný filter počas výpadku AI. Pozor: kontrolujeme len čisto príslušenstvo,
-    a nevyraďujeme inzeráty, ktoré majú v popise "inkl. Gigbag / mit Cover / Original Speaker"!
-    """
-    demand_words = ["kúpim", "kupim", "hľadám", "hladam", "suche", "kaufe", "cerco"]
-    accessory_only_patterns = [
-        r"^(?:flightcase|case|cover|hülle|abdeckung|schutzhülle|schutzhaube|tasche|custodia|leerkarton|karton|ovp|footswitch|fußschalter)\b",
-        r"\b(?:nur\s+karton|nur\s+case|leerkarton|empty\s+box|ersatzteil)\b",
-    ]
-
-    results = {}
-    for ad in ads:
-        title_lower = ad["title"].lower()
-        text_lower = f"{ad['title']} {ad['description']}".lower()
-        target_words = [
-            w.lower()
-            for w in re.findall(r"[a-zA-Z0-9]+", ad["target_item"])
-            if len(w) >= 3 and w.lower() not in ("fender", "victory", "mk", "ii", "the", "reissue", "custom")
-        ]
-
-        is_demand = any(re.search(rf"\b{dw}\b", title_lower) for dw in demand_words)
-        is_accessory_only = any(re.search(pat, title_lower) for pat in accessory_only_patterns)
-
-        if is_demand or is_accessory_only:
-            results[str(ad["id"])] = {
-                "id": ad["id"],
-                "is_match": False,
-                "matched_item_name": ad["target_item"],
-                "reason": "Vyradené lokálnym filtrom (príslušenstvo / dopyt)",
-            }
-        elif target_words and not all(tw in text_lower for tw in target_words):
-            results[str(ad["id"])] = {
-                "id": ad["id"],
-                "is_match": False,
-                "matched_item_name": ad["target_item"],
-                "reason": "Vyradené lokálnym filtrom (chýba kľúčové označenie modelu)",
-            }
-        else:
-            results[str(ad["id"])] = {
-                "id": ad["id"],
-                "is_match": True,
-                "matched_item_name": ad["target_item"],
-                "reason": "Nájdená zhoda (overené záložným filtrom počas výpadku AI)",
-            }
-    return results
-
-
-def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict]:
+def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict] | None:
     items_for_prompt = [
         {
             "id": a["id"],
             "portal": a["portal"],
             "searched_for": a["target_item"],
             "title": a["title"],
-            "price_text": a["price_text"],
-            "description": a["description"][:350],
+            "price": a["price_text"],
+            "description": a["description"][:250],
         }
         for a in ads
     ]
+
     prompt = f"""
-    Si inteligentný nákupný asistent. Používateľ hľadá na Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com tieto položky:
+    Analyzuj tento zoznam inzerátov z portálov Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com.
+    Používateľ hľadá tieto položky:
     {json.dumps(watchlist, ensure_ascii=False)}
 
-    Tu je zoznam novo nájdených inzerátov (v slovenčine, nemčine alebo taliančine):
+    Zoznam inzerátov na posúdenie:
     {json.dumps(items_for_prompt, ensure_ascii=False)}
 
-    Pre každý inzerát vráť objekt v JSON poli s týmito poľami:
+    Pre každý inzerát vráť objekt v JSON poli (zozname) s týmito poľami:
     - "id": rovnaké ID inzerátu ako na vstupe
-    - "is_match": true ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo jej priamu verziu, napr. pri hľadaní "V40 Duchess MK II" vezmi aj "Victory V40 The Duchess" / "V40 Duchess", pretože predávajúci často nepíšu MK II). Ber do úvahy aj preklepy. Daj false IBA vtedy, ak ide o dopyt ("Kúpim", "Suche", "Cerco"), prenájom, výmenu, samotné príslušenstvo bez prístroja (samotný obal, krabica, footswitch) alebo úplne iný produkt (napr. efektový pedál Boss FDR-1 namiesto komba Fender).
-    - "matched_item_name": Čistý rozpoznaný názov modelu v inzeráte.
-    - "reason": Krátke zhrnutie v slovenčine (1 veta).
+    - "is_match": true ak ide o predaj hľadanej položky (pole "searched_for" alebo inej položky zo zoznamu používateľa).
+      DÔLEŽITÉ PRAVIDLÁ:
+      1. Ľudia robia preklepy (napr. "delux reverb") alebo nepíšu celé označenie verzie (napr. pri hľadaní "V40 Duchess MK II" vezmi ako true aj "Victory V40 The Duchess" alebo "Victory V40 Duchess", a pri "Fender 65 Deluxe Reverb" vezmi aj "Fender Deluxe Reverb").
+      2. Ak je v názve uvedené "inkl. Gigbag", "mit Cover", "con custodia", "inkl. Footswitch", ide o predaj samotného zosilňovača/nástroja aj s obalom -> daj true!
+      3. Daj false, ak ide o dopyt ("Kúpim", "Suche", "Cerco"), prenájom, výmenu, samotný prázdny obal/kufor/krabicu bez prístroja, samotný reproduktor alebo úplne iný prístroj (napr. krabičkový pedál Boss FDR-1 namiesto komba Fender, alebo Orange Rockerverb).
+    - "matched_item_name": Presný názov rozpoznaného modelu v inzeráte.
+    - "reason": Krátke vysvetlenie v slovenčine (max 8 slov).
     """
-    print(f"Posielam dávku {len(ads)} inzerátov do Gemini AI na kontrolu...", flush=True)
-    parsed_list = call_gemini_json(prompt)
-    if isinstance(parsed_list, list):
-        return {str(item.get("id")): item for item in parsed_list}
 
-    print(" -> Gemini API je momentálne vyťažené (503), používam záložný lokálny filter.", flush=True)
-    return verify_ads_fallback_locally(ads)
+    for attempt in range(4):
+        try:
+            print(f"Posielam všetky inzeráty ({len(ads)} ks) naraz v 1 dotaze do Gemini AI...", flush=True)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            parsed_list = json.loads(response.text)
+            return {str(item.get("id")): item for item in parsed_list}
+        except Exception as e:
+            print(f"[AI Pokus {attempt + 1}/4 zlyhal]: {e}", flush=True)
+            # Počkáme 15 sekúnd pred ďalším pokusom (kvôli 5 RPM limitu a špičkám)
+            time.sleep(15)
+
+    return None
 
 
 # ==========================================
-# 6. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
+# 5. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
 # ==========================================
 def save_and_notify(ad: dict, ai_info: dict):
     file_exists = os.path.isfile(CSV_OUTPUT)
@@ -527,6 +463,9 @@ def save_and_notify(ad: dict, ai_info: dict):
             print(f"Chyba pri odosielaní na Telegram: {e}", flush=True)
 
 
+# ==========================================
+# HLAVNÝ PROGRAM
+# ==========================================
 def main():
     watchlist = load_watchlist()
     if not watchlist:
@@ -538,12 +477,10 @@ def main():
         print(f" - {item}", flush=True)
 
     seen_ads = load_seen_ads()
-    search_plan = generate_search_queries_with_ai(watchlist)
     collected_ads_by_id = {}
 
-    for entry in search_plan:
-        target_item = entry.get("target_item", "")
-        queries = entry.get("queries", [])
+    for target_item in watchlist:
+        queries = build_search_queries(target_item)
         print(f"\nHľadám: '{target_item}' (výrazy: {queries})", flush=True)
 
         for q in queries:
@@ -576,28 +513,28 @@ def main():
     if not new_ads:
         return
 
-    batch_size = 40
+    # Presne ako v tvojom pôvodnom scraperi: VŠETKY inzeráty pošleme v 1 jedinom volaní do Gemini AI!
+    ai_results = parse_ads_batch_with_ai(new_ads, watchlist)
+    if ai_results is None:
+        print("AI analýza momentálne zlyhala, inzeráty neoznačujem ako videné a skúsim pri ďalšom behu.", flush=True)
+        return
+
     matches_count = 0
+    for ad in new_ads:
+        seen_ads.add(ad["id"])
+        ai_info = ai_results.get(str(ad["id"]), {})
 
-    for i in range(0, len(new_ads), batch_size):
-        batch = new_ads[i : i + batch_size]
-        ai_results = verify_ads_batch_with_ai(batch, watchlist)
-
-        for ad in batch:
-            seen_ads.add(ad["id"])
-            ai_info = ai_results.get(str(ad["id"]), {})
-
-            if ai_info.get("is_match"):
-                matches_count += 1
-                save_and_notify(ad, ai_info)
-            else:
-                print(
-                    f" [X] Vyradené ({ad['portal']}): {ad['title']} -> {ai_info.get('reason', 'Nezodpovedá zadaniu')}",
-                    flush=True,
-                )
+        if ai_info.get("is_match"):
+            matches_count += 1
+            save_and_notify(ad, ai_info)
+        else:
+            print(
+                f" [X] Vyradené AI ({ad['portal']}): {ad['title']} -> {ai_info.get('reason', 'Nezodpovedá zadaniu')}",
+                flush=True,
+            )
 
     save_seen_ads(seen_ads)
-    print(f"\nHotovo! Uložených {matches_count} zhodných inzerátov.", flush=True)
+    print(f"\nHotovo! Uložených {matches_count} zhodných inzerátov (overených cez Gemini AI).", flush=True)
 
 
 if __name__ == "__main__":
