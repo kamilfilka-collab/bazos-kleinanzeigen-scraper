@@ -21,7 +21,6 @@ WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
 
-# Zoznam modelov od primárneho po záložné (ak má hlavný model 503 High Demand)
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.8-flash-lite",
@@ -30,18 +29,13 @@ GEMINI_MODELS = [
 if not GEMINI_API_KEY:
     raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets alebo v prostredí.")
 
-# Nastavenie prísneho HTTP timeoutu (15 sekúnd) na Gemini klienta, aby pri 503 nikdy nezamrzol!
 client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(timeout=15000),
 )
 
 
-# ==========================================
-# POMOCNÉ FUNKCIE PRE SÚBORY A CENY
-# ==========================================
 def load_watchlist() -> list[str]:
-    """Načíta hľadané položky z jednoduchého textového súboru watchlist.txt."""
     if not os.path.exists(WATCHLIST_FILE):
         print(f"Upozornenie: Súbor {WATCHLIST_FILE} neexistuje!")
         return []
@@ -69,7 +63,6 @@ def save_seen_ads(seen_set: set[str]):
 
 
 def parse_euro_price(raw_text: str) -> float | None:
-    """Prevedie textovú cenu (napr. '1.479 € VB', '250 €', 'Dohodou') na číslo (float)."""
     if not raw_text:
         return None
     cleaned = re.sub(r"[^\d.,]", "", raw_text).strip(".,")
@@ -99,7 +92,6 @@ def parse_euro_price(raw_text: str) -> float | None:
 
 
 def call_gemini_json(prompt: str) -> list | dict | None:
-    """Zavolá Gemini API s 15s timeoutom. Ak má výpadok, okamžite prepne na záložný režim."""
     for model_name in GEMINI_MODELS:
         try:
             response = client.models.generate_content(
@@ -118,42 +110,28 @@ def call_gemini_json(prompt: str) -> list | dict | None:
 
 
 def build_smart_fallback_queries(item: str) -> list[str]:
-    """
-    Vytvorí okrem plného názvu aj skrátený variant bez označení ako MK II, MK2, '65, 65,
-    aby Bazoš a Kleinanzeigen našli viac zhôd aj bez AI.
-    """
     base = re.sub(r"\(.*?\)", "", item).strip()
     queries = [base]
-
-    # Odstránime "MK II", "MKII", "MK 2", alebo samostatné dvojciferné ročníky ako "65"
     simplified = re.sub(r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2})\b", "", base, flags=re.IGNORECASE)
     simplified = re.sub(r"\s+", " ", simplified).strip(" -")
     if simplified and simplified.lower() != base.lower() and len(simplified) >= 3:
         queries.append(simplified)
-
-    # Ak je tam pomlčka (napr. DDJ-400), pridáme aj verziu s medzerou
     if "-" in base:
         no_dash = base.replace("-", " ")
         no_dash = re.sub(r"\s+", " ", no_dash).strip()
         if no_dash not in queries:
             queries.append(no_dash)
-
     return queries[:3]
 
 
-# ==========================================
-# 1. AI GENEROVANIE HĽADACÍCH VÝRAZOV (AJ S PREKLEPMI)
-# ==========================================
 def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
     prompt = f"""
     Mám zoznam položiek, ktoré hľadám na inzertných portáloch Bazoš.sk a Kleinanzeigen.de:
     {json.dumps(watchlist, ensure_ascii=False)}
 
-    Ľudia v inzerátoch často nepíšu celý katalógový názov (napr. namiesto "Fender 65 Deluxe Reverb" napíšu len "Fender Deluxe Reverb", alebo namiesto "V40 Duchess MK II" napíšu len "V40 Duchess" alebo "Victory V40"). Často tiež vynechávajú pomlčky a medzery.
     Pre každú položku zo vstupného zoznamu vygeneruj JSON pole objektov s týmito poľami:
     - "target_item": pôvodný text položky zo zoznamu
     - "queries": pole 2 až 3 krátkych kľúčových výrazov (2-3 najdôležitejšie slová, od špecifického po širší základný model bez zbytočných prívlastkov ako MK II alebo 65), ktoré najlepšie nájdu túto položku vo vyhľadávači na Bazoši a Kleinanzeigen.
-
     Vráť čisto JSON pole.
     """
     parsed = call_gemini_json(prompt)
@@ -161,18 +139,9 @@ def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
         return parsed
 
     print(" -> Používam lokálne generovanie vyhľadávacích výrazov (záložný režim).", flush=True)
-    fallback = []
-    for item in watchlist:
-        fallback.append({
-            "target_item": item,
-            "queries": build_smart_fallback_queries(item),
-        })
-    return fallback
+    return [{"target_item": item, "queries": build_smart_fallback_queries(item)} for item in watchlist]
 
 
-# ==========================================
-# 2. SŤAHOVANIE BAZOŠ.SK (RSS + HTML VYHĽADÁVANIE)
-# ==========================================
 def parse_bazos_rss_xml(xml_text: str, target_item: str) -> list[dict]:
     ads = []
     try:
@@ -195,7 +164,6 @@ def parse_bazos_rss_xml(xml_text: str, target_item: str) -> list[dict]:
                 clean_title = title_raw[: price_match.start()].strip()
 
             clean_desc = BeautifulSoup(desc_html, "html.parser").get_text(" ", strip=True)
-
             ads.append({
                 "id": ad_id,
                 "portal": "Bazos.sk",
@@ -247,25 +215,16 @@ def parse_bazos_html(html_text: str, target_item: str) -> list[dict]:
 
 def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.8,en;q=0.7",
     }
     encoded_q = quote_plus(query)
     rss_base = f"https://www.bazos.sk/rss.php?hledat={encoded_q}"
-    rss_candidates = [
-        rss_base,
-        f"https://corsproxy.io/?{quote_plus(rss_base)}",
-    ]
-
-    for url in rss_candidates:
+    for url in [rss_base, f"https://corsproxy.io/?{quote_plus(rss_base)}"]:
         try:
             r = requests.get(url, headers=headers, timeout=8)
             if r.status_code == 200 and "<rss" in r.text:
-                ads = parse_bazos_rss_xml(r.text, target_item)
-                return ads
+                return parse_bazos_rss_xml(r.text, target_item)
         except Exception:
             pass
 
@@ -276,24 +235,18 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
             return parse_bazos_html(r.text, target_item)
     except Exception as e:
         print(f" -> Bazoš HTML pokus zlyhal pre '{query}': {e}", flush=True)
-
     return []
 
 
-# ==========================================
-# 3. SŤAHOVANIE KLEINANZEIGEN.DE (RÝCHLY HTTP REQUEST)
-# ==========================================
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
     soup = BeautifulSoup(html_text, "html.parser")
-    articles = soup.select("article[data-adid], article.aditem")
-
-    for art in articles:
+    for art in soup.select("article[data-adid], article.aditem"):
         data_id = art.get("data-adid")
         href = art.get("data-href") or ""
-
         title = ""
         desc = ""
+
         ld_script = art.select_one('script[type="application/ld+json"]')
         if ld_script and ld_script.string:
             try:
@@ -313,7 +266,6 @@ def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
             title = link_el.get_text(" ", strip=True)
         if not href and link_el:
             href = link_el.get("href", "")
-
         if not title and not data_id:
             continue
 
@@ -321,17 +273,11 @@ def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
         ad_id = f"ka_{data_id}" if data_id else f"ka_{link}"
 
         if not desc:
-            desc_el = (
-                art.select_one("p.aditem-main--middle--description")
-                or art.select_one("p.text-bodyRegular.text-onSurfaceSubdued")
-            )
+            desc_el = art.select_one("p.aditem-main--middle--description") or art.select_one("p.text-bodyRegular.text-onSurfaceSubdued")
             if desc_el:
                 desc = desc_el.get_text(" ", strip=True)
 
-        price_el = (
-            art.select_one("p.aditem-main--middle--price-shipping--price")
-            or art.select_one("p.text-title3.font-strong")
-        )
+        price_el = art.select_one("p.aditem-main--middle--price-shipping--price") or art.select_one("p.text-title3.font-strong")
         price_raw = price_el.get_text(" ", strip=True) if price_el else ""
         price = parse_euro_price(price_raw)
 
@@ -354,32 +300,19 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
         return []
     url = f"https://www.kleinanzeigen.de/s-anzeige:angebote/{slug}/k0"
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
     }
-
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200 and "data-adid" in r.text:
             return parse_kleinanzeigen_html(r.text, target_item)
     except Exception as e:
         print(f" -> Kleinanzeigen pokus zlyhal pre '{query}': {e}", flush=True)
-
     return []
 
 
-# ==========================================
-# 4. HROMADNÁ AI ANALÝZA INZERÁTOV (GEMINI + ZÁLOŽNÝ FILTER)
-# ==========================================
 def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
-    """
-    Záložné vyhodnotenie inzerátov v prípade, že sú modely Google Gemini
-    dočasne preťažené (chyba 503). Vyradí očividné dopyty, obaly/príslušenstvo
-    a inzeráty, kde chýba kľúčové slovo hľadaného modelu.
-    """
     bad_keywords = [
         "kúpim", "kupim", "hľadám", "hladam", "suche", "kaufe",
         "flightcase", "case", "cover", "hülle", "abdeckung", "tasche",
@@ -394,7 +327,6 @@ def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
             for w in re.findall(r"[a-zA-Z0-9]+", ad["target_item"])
             if len(w) >= 3 and w.lower() not in ("fender", "victory", "mk", "ii", "the")
         ]
-
         if any(bad in text_lower for bad in bad_keywords):
             results[str(ad["id"])] = {
                 "id": ad["id"],
@@ -407,7 +339,7 @@ def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
                 "id": ad["id"],
                 "is_match": False,
                 "matched_item_name": ad["target_item"],
-                "reason": "Vyradené lokálnym filtrom (chýba kľúčové označenie modelu v názve/popise)",
+                "reason": "Vyradené lokálnym filtrom (chýba kľúčové označenie modelu)",
             }
         else:
             results[str(ad["id"])] = {
@@ -431,7 +363,6 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
         }
         for a in ads
     ]
-
     prompt = f"""
     Si inteligentný nákupný asistent. Používateľ hľadá na Bazoš.sk a Kleinanzeigen.de tieto položky:
     {json.dumps(watchlist, ensure_ascii=False)}
@@ -441,15 +372,10 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
 
     Pre každý inzerát vráť objekt v JSON poli s týmito poľami:
     - "id": rovnaké ID inzerátu ako na vstupe
-    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Ber do úvahy, že predávajúci mohol spraviť v názve preklep alebo vynechať časť označenia (napr. napísal len "Fender Deluxe Reverb" a v texte/nadpise ide o 65 Deluxe Reverb).
-      Daj false, ak:
-      1. Ide o dopyt ("Kúpim", "Hľadám", "Suche", "Kaufe"), prenájom alebo výmenu.
-      2. Predáva sa iba príslušenstvo (samotný kufor, obal, flightcase, kryt, krabica, adaptér, kábel, footswitch, reproduktor, náhradný diel).
-      3. Ide o iný model alebo značku (napr. pri hľadaní lampového '65 Deluxe Reverb vyraď digitálnu verziu Tone Master, ak používateľ hľadá konkrétne 65 Deluxe Reverb), prípadne inzerát porušuje obmedzenie v poznámke.
+    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Daj false, ak ide o dopyt ("Kúpim", "Suche"), prenájom, výmenu, samotné príslušenstvo (obal, flightcase, footswitch, reproduktor, krabica) alebo iný model.
     - "matched_item_name": Čistý rozpoznaný názov modelu v inzeráte.
-    - "reason": Krátke zhrnutie v slovenčine (1 veta, napr. "Predaj gitarového komba Fender '65 Deluxe Reverb").
+    - "reason": Krátke zhrnutie v slovenčine (1 veta).
     """
-
     print(f"Posielam dávku {len(ads)} inzerátov do Gemini AI na kontrolu...", flush=True)
     parsed_list = call_gemini_json(prompt)
     if isinstance(parsed_list, list):
@@ -459,23 +385,14 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
     return verify_ads_fallback_locally(ads)
 
 
-# ==========================================
-# 5. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
-# ==========================================
 def save_and_notify(ad: dict, ai_info: dict):
     file_exists = os.path.isfile(CSV_OUTPUT)
     with open(CSV_OUTPUT, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "Dátum",
-                "Portál",
-                "Hľadaná položka",
-                "Rozpoznaný model",
-                "Názov inzerátu",
-                "Cena",
-                "AI Poznámka",
-                "URL",
+                "Dátum", "Portál", "Hľadaná položka", "Rozpoznaný model",
+                "Názov inzerátu", "Cena", "AI Poznámka", "URL",
             ])
         writer.writerow([
             time.strftime("%Y-%m-%d %H:%M"),
@@ -506,10 +423,69 @@ def save_and_notify(ad: dict, ai_info: dict):
             print(f"Chyba pri odosielaní na Telegram: {e}", flush=True)
 
 
-# ==========================================
-# HLAVNÝ PROGRAM
-# ==========================================
 def main():
     watchlist = load_watchlist()
     if not watchlist:
-        print(f"Zoznam {WATCHLIST_FILE} je prázdny. Pridaj do neho
+        print(f"Zoznam {WATCHLIST_FILE} je prázdny.", flush=True)
+        return
+
+    print(f"Načítaných {len(watchlist)} hľadaných položiek z {WATCHLIST_FILE}:", flush=True)
+    for item in watchlist:
+        print(f" - {item}", flush=True)
+
+    seen_ads = load_seen_ads()
+    search_plan = generate_search_queries_with_ai(watchlist)
+    collected_ads_by_id = {}
+
+    for entry in search_plan:
+        target_item = entry.get("target_item", "")
+        queries = entry.get("queries", [])
+        print(f"\nHľadám: '{target_item}' (výrazy: {queries})", flush=True)
+
+        for q in queries:
+            bazos_ads = fetch_bazos_for_query(q, target_item)
+            print(f" -> [Bazoš.sk] '{q}': nájdených {len(bazos_ads)} inzerátov", flush=True)
+            for ad in bazos_ads:
+                if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
+                    collected_ads_by_id[ad["id"]] = ad
+
+            ka_ads = fetch_kleinanzeigen_for_query(q, target_item)
+            print(f" -> [Kleinanzeigen.de] '{q}': nájdených {len(ka_ads)} inzerátov", flush=True)
+            for ad in ka_ads:
+                if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
+                    collected_ads_by_id[ad["id"]] = ad
+
+            time.sleep(1.0)
+
+    new_ads = list(collected_ads_by_id.values())
+    print(f"\nCelkovo nájdených {len(new_ads)} nových (ešte nevidených) inzerátov.", flush=True)
+
+    if not new_ads:
+        return
+
+    batch_size = 40
+    matches_count = 0
+
+    for i in range(0, len(new_ads), batch_size):
+        batch = new_ads[i : i + batch_size]
+        ai_results = verify_ads_batch_with_ai(batch, watchlist)
+
+        for ad in batch:
+            seen_ads.add(ad["id"])
+            ai_info = ai_results.get(str(ad["id"]), {})
+
+            if ai_info.get("is_match"):
+                matches_count += 1
+                save_and_notify(ad, ai_info)
+            else:
+                print(
+                    f" [X] Vyradené ({ad['portal']}): {ad['title']} -> {ai_info.get('reason', 'Nezodpovedá zadaniu')}",
+                    flush=True,
+                )
+
+    save_seen_ads(seen_ads)
+    print(f"\nHotovo! Uložených {matches_count} zhodných inzerátov.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
