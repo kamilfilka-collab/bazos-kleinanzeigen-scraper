@@ -124,14 +124,17 @@ def build_smart_fallback_queries(item: str) -> list[str]:
     return queries[:3]
 
 
+# ==========================================
+# 1. AI GENEROVANIE HĽADACÍCH VÝRAZOV (AJ S PREKLEPMI)
+# ==========================================
 def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
     prompt = f"""
-    Mám zoznam položiek, ktoré hľadám na inzertných portáloch Bazoš.sk a Kleinanzeigen.de:
+    Mám zoznam položiek, ktoré hľadám na inzertných portáloch Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com:
     {json.dumps(watchlist, ensure_ascii=False)}
 
     Pre každú položku zo vstupného zoznamu vygeneruj JSON pole objektov s týmito poľami:
     - "target_item": pôvodný text položky zo zoznamu
-    - "queries": pole 2 až 3 krátkych kľúčových výrazov (2-3 najdôležitejšie slová, od špecifického po širší základný model bez zbytočných prívlastkov ako MK II alebo 65), ktoré najlepšie nájdu túto položku vo vyhľadávači na Bazoši a Kleinanzeigen.
+    - "queries": pole 2 až 3 krátkych kľúčových výrazov (2-3 najdôležitejšie slová, od špecifického po širší základný model bez zbytočných prívlastkov ako MK II alebo 65), ktoré najlepšie nájdu túto položku vo vyhľadávači.
     Vráť čisto JSON pole.
     """
     parsed = call_gemini_json(prompt)
@@ -142,6 +145,9 @@ def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
     return [{"target_item": item, "queries": build_smart_fallback_queries(item)} for item in watchlist]
 
 
+# ==========================================
+# 2. SŤAHOVANIE BAZOŠ.SK
+# ==========================================
 def parse_bazos_rss_xml(xml_text: str, target_item: str) -> list[dict]:
     ads = []
     try:
@@ -238,6 +244,9 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
     return []
 
 
+# ==========================================
+# 3. SŤAHOVANIE KLEINANZEIGEN.DE
+# ==========================================
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
     soup = BeautifulSoup(html_text, "html.parser")
@@ -312,12 +321,82 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
     return []
 
 
+# ==========================================
+# 4. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
+# ==========================================
+def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
+    ads = []
+    soup = BeautifulSoup(html_text, "html.parser")
+    for box in soup.select("div.box_prod"):
+        link_el = box.select_one("a.box_prod_link")
+        if not link_el:
+            continue
+
+        href = link_el.get("href", "")
+        if not href:
+            continue
+
+        link = f"https://www.mercatinomusicale.com{href}" if href.startswith("/") else href
+        match_id = re.search(r"_id(\d+)\.html", link)
+        ad_id = f"mm_{match_id.group(1)}" if match_id else f"mm_{link}"
+
+        tit_el = box.select_one("span.tit")
+        title = tit_el.get_text(" ", strip=True) if tit_el else ""
+        if not title:
+            continue
+
+        desc_el = box.select_one("span.desc")
+        desc = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+        cond_el = box.select_one("span.cond")
+        cond = cond_el.get_text(" ", strip=True) if cond_el else ""
+        if cond:
+            desc = f"[{cond}] {desc}"
+
+        prz_el = box.select_one("span.prz")
+        price_raw = prz_el.get_text("", strip=True) if prz_el else ""
+        price = parse_euro_price(price_raw)
+        price_text = f"{int(price)} €" if price is not None else (price_raw or "Neuvedená")
+
+        ads.append({
+            "id": ad_id,
+            "portal": "MercatinoMusicale.com",
+            "target_item": target_item,
+            "title": title,
+            "description": desc,
+            "price": price,
+            "price_text": price_text,
+            "url": link,
+        })
+    return ads
+
+
+def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
+    encoded_q = quote_plus(query)
+    # ob=data zoradí výsledky od najnovších inzerátov
+    url = f"https://www.mercatinomusicale.com/ann/search.asp?ns=1&kw={encoded_q}&ob=data"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200 and "box_prod" in r.text:
+            return parse_mercatino_html(r.text, target_item)
+    except Exception as e:
+        print(f" -> MercatinoMusicale pokus zlyhal pre '{query}': {e}", flush=True)
+    return []
+
+
+# ==========================================
+# 5. HROMADNÁ AI ANALÝZA INZERÁTOV (GEMINI + ZÁLOŽNÝ FILTER)
+# ==========================================
 def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
     bad_keywords = [
-        "kúpim", "kupim", "hľadám", "hladam", "suche", "kaufe",
-        "flightcase", "case", "cover", "hülle", "abdeckung", "tasche",
-        "leerkarton", "karton", "ovp", "footswitch", "fußschalter",
-        "röhre", "tubes", "speaker", "ersatzteil", "schutzhaube",
+        "kúpim", "kupim", "hľadám", "hladam", "suche", "kaufe", "cerco",
+        "flightcase", "case", "cover", "hülle", "abdeckung", "tasche", "custodia",
+        "leerkarton", "karton", "ovp", "footswitch", "fußschalter", "pedale switch",
+        "röhre", "tubes", "valvole", "speaker", "ersatzteil", "schutzhaube",
     ]
     results = {}
     for ad in ads:
@@ -364,15 +443,15 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
         for a in ads
     ]
     prompt = f"""
-    Si inteligentný nákupný asistent. Používateľ hľadá na Bazoš.sk a Kleinanzeigen.de tieto položky:
+    Si inteligentný nákupný asistent. Používateľ hľadá na Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com tieto položky:
     {json.dumps(watchlist, ensure_ascii=False)}
 
-    Tu je zoznam novo nájdených inzerátov:
+    Tu je zoznam novo nájdených inzerátov (v slovenčine, nemčine alebo taliančine):
     {json.dumps(items_for_prompt, ensure_ascii=False)}
 
     Pre každý inzerát vráť objekt v JSON poli s týmito poľami:
     - "id": rovnaké ID inzerátu ako na vstupe
-    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Daj false, ak ide o dopyt ("Kúpim", "Suche"), prenájom, výmenu, samotné príslušenstvo (obal, flightcase, footswitch, reproduktor, krabica) alebo iný model.
+    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Ber do úvahy aj preklepy (napr. "delux reverb" namiesto "deluxe reverb"). Daj false, ak ide o dopyt ("Kúpim", "Suche", "Cerco"), prenájom, výmenu, samotné príslušenstvo (obal, cover, flightcase, custodia, footswitch, reproduktor, krabica) alebo iný model.
     - "matched_item_name": Čistý rozpoznaný názov modelu v inzeráte.
     - "reason": Krátke zhrnutie v slovenčine (1 veta).
     """
@@ -385,6 +464,9 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
     return verify_ads_fallback_locally(ads)
 
 
+# ==========================================
+# 6. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
+# ==========================================
 def save_and_notify(ad: dict, ai_info: dict):
     file_exists = os.path.isfile(CSV_OUTPUT)
     with open(CSV_OUTPUT, mode="a", newline="", encoding="utf-8") as f:
@@ -443,15 +525,24 @@ def main():
         print(f"\nHľadám: '{target_item}' (výrazy: {queries})", flush=True)
 
         for q in queries:
+            # 1. Bazoš.sk
             bazos_ads = fetch_bazos_for_query(q, target_item)
             print(f" -> [Bazoš.sk] '{q}': nájdených {len(bazos_ads)} inzerátov", flush=True)
             for ad in bazos_ads:
                 if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
                     collected_ads_by_id[ad["id"]] = ad
 
+            # 2. Kleinanzeigen.de
             ka_ads = fetch_kleinanzeigen_for_query(q, target_item)
             print(f" -> [Kleinanzeigen.de] '{q}': nájdených {len(ka_ads)} inzerátov", flush=True)
             for ad in ka_ads:
+                if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
+                    collected_ads_by_id[ad["id"]] = ad
+
+            # 3. MercatinoMusicale.com
+            mm_ads = fetch_mercatino_for_query(q, target_item)
+            print(f" -> [MercatinoMusicale.com] '{q}': nájdených {len(mm_ads)} inzerátov", flush=True)
+            for ad in mm_ads:
                 if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
                     collected_ads_by_id[ad["id"]] = ad
 
