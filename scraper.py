@@ -21,7 +21,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 if not GEMINI_API_KEY:
     raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets alebo v prostredí.")
@@ -103,10 +103,10 @@ def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
     Mám zoznam položiek, ktoré hľadám na inzertných portáloch Bazoš.sk a Kleinanzeigen.de:
     {json.dumps(watchlist, ensure_ascii=False)}
 
-    Ľudia v inzerátoch často vynechávajú pomlčky, medzery alebo robia drobné preklepy (napr. "ddj 400", "ddj400", "stratocaster", "psre443").
+    Ľudia v inzerátoch často nepíšu celý katalógový názov (napr. namiesto "Fender 65 Deluxe Reverb" napíšu len "Fender Deluxe Reverb", alebo namiesto "V40 Duchess MK II" napíšu len "V40 Duchess" alebo "Victory V40"). Často tiež vynechávajú pomlčky a medzery.
     Pre každú položku zo vstupného zoznamu vygeneruj JSON pole objektov s týmito poľami:
     - "target_item": pôvodný text položky zo zoznamu
-    - "queries": pole 1 až 3 krátkych kľúčových výrazov (2-3 slová bez zátvoriek a poznámok), ktoré najlepšie nájdu túto položku vo vyhľadávači na Bazoši a Kleinanzeigen (vrátane najčastejšieho alternatívneho zápisu bez pomlčky/medzery).
+    - "queries": pole 2 až 3 krátkych kľúčových výrazov (2-3 najdôležitejšie slová, od špecifického po širší základný model bez zbytočných prívlastkov ako MK II alebo 65), ktoré najlepšie nájdu túto položku vo vyhľadávači na Bazoši a Kleinanzeigen.
 
     Vráť čisto JSON pole.
     """
@@ -125,7 +125,7 @@ def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
             print(f"[AI Generovanie výrazov - pokus {attempt + 1}/3 zlyhal]: {e}")
             time.sleep(5)
 
-    # Záložné riešenie, ak by AI neodpovedala: odstránime zátvorky a použijeme čistý názov
+    # Záložné riešenie, ak by AI neodpovedala
     fallback = []
     for item in watchlist:
         clean_q = re.sub(r"\(.*?\)", "", item).strip()
@@ -246,30 +246,60 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 3. SŤAHOVANIE KLEINANZEIGEN.DE
+# 3. SŤAHOVANIE KLEINANZEIGEN.DE (NOVÝ AJ STARÝ DIZAJN)
 # ==========================================
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
     soup = BeautifulSoup(html_text, "html.parser")
-    articles = soup.select("article.aditem")
+    # Kleinanzeigen používa atribút data-adid na značke <article>
+    articles = soup.select("article[data-adid], article.aditem")
 
     for art in articles:
         data_id = art.get("data-adid")
-        link_el = art.select_one("a.ellipsis") or art.select_one("h2 a")
-        if not link_el and not data_id:
+        href = art.get("data-href") or ""
+
+        # Názov a popis môžeme získať z vloženého JSON-LD alebo priamo z HTML elementov
+        title = ""
+        desc = ""
+        ld_script = art.select_one('script[type="application/ld+json"]')
+        if ld_script and ld_script.string:
+            try:
+                ld_data = json.loads(ld_script.string)
+                title = ld_data.get("title", "").strip()
+                desc = ld_data.get("description", "").strip()
+            except Exception:
+                pass
+
+        link_el = (
+            art.select_one("h3 a")
+            or art.select_one("h2 a")
+            or art.select_one("a.ellipsis")
+            or art.select_one('a[href^="/s-anzeige/"]')
+        )
+        if not title and link_el:
+            title = link_el.get_text(" ", strip=True)
+        if not href and link_el:
+            href = link_el.get("href", "")
+
+        if not title and not data_id:
             continue
 
-        title = link_el.get_text(strip=True) if link_el else ""
-        href = link_el.get("href", "") if link_el else art.get("data-href", "")
         link = f"https://www.kleinanzeigen.de{href}" if href.startswith("/") else href
-
         ad_id = f"ka_{data_id}" if data_id else f"ka_{link}"
 
-        desc_el = art.select_one("p.aditem-main--middle--description")
-        desc = desc_el.get_text(" ", strip=True) if desc_el else ""
+        if not desc:
+            desc_el = (
+                art.select_one("p.aditem-main--middle--description")
+                or art.select_one("p.text-bodyRegular.text-onSurfaceSubdued")
+            )
+            if desc_el:
+                desc = desc_el.get_text(" ", strip=True)
 
-        price_el = art.select_one("p.aditem-main--middle--price-shipping--price")
-        price_raw = price_el.get_text(strip=True) if price_el else ""
+        price_el = (
+            art.select_one("p.aditem-main--middle--price-shipping--price")
+            or art.select_one("p.text-title3.font-strong")
+        )
+        price_raw = price_el.get_text(" ", strip=True) if price_el else ""
         price = parse_euro_price(price_raw)
 
         ads.append({
@@ -286,8 +316,11 @@ def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
 
 
 def fetch_kleinanzeigen_for_query(query: str, target_item: str, browser_context) -> list[dict]:
-    encoded_q = quote_plus(query)
-    url = f"https://www.kleinanzeigen.de/s-anzeige:angebote/{encoded_q}/k0"
+    # Kleinanzeigen URL vyhľadávanie používa pomlčky namiesto medzier
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", query.strip().lower()).strip("-")
+    if not slug:
+        return []
+    url = f"https://www.kleinanzeigen.de/s-anzeige:angebote/{slug}/k0"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -299,7 +332,7 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str, browser_context)
     # 1. Rýchly pokus cez priamy HTTP request
     try:
         r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code == 200 and "aditem" in r.text:
+        if r.status_code == 200 and "data-adid" in r.text:
             ads = parse_kleinanzeigen_html(r.text, target_item)
             if ads:
                 return ads
@@ -352,13 +385,13 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
 
     Pre každý inzerát vráť objekt v JSON poli s týmito poľami:
     - "id": rovnaké ID inzerátu ako na vstupe
-    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Ber do úvahy, že predávajúci mohol spraviť v názve preklep.
+    - "is_match": true IBA vtedy, ak inzerát skutočne predáva hľadanú položku (pole "searched_for" alebo inú položku zo zoznamu používateľa). Ber do úvahy, že predávajúci mohol spraviť v názve preklep alebo vynechať časť označenia (napr. napísal len "Fender Deluxe Reverb" a v texte/nadpise ide o 65 Deluxe Reverb).
       Daj false, ak:
       1. Ide o dopyt ("Kúpim", "Hľadám", "Suche", "Kaufe"), prenájom alebo výmenu.
-      2. Predáva sa iba príslušenstvo (samotný kufor, obal, decksaver, krabica, adaptér, kábel, stojan, náhradný diel).
-      3. Ide o iný model alebo značku, prípadne je v poznámke položky zo zoznamu uvedené obmedzenie (napr. "nie Squier" alebo cenový strop), ktoré inzerát porušuje.
-    - "matched_item_name": Čistý rozpoznaný názov modelu v inzeráte (napr. "Pioneer DDJ-400").
-    - "reason": Krátke zhrnutie v slovenčine (1 veta, napr. "Predaj kontroléra Pioneer DDJ-400 v dobrom stave").
+      2. Predáva sa iba príslušenstvo (samotný kufor, obal, flightcase, kryt, krabica, adaptér, kábel, footswitch, reproduktor, náhradný diel).
+      3. Ide o iný model alebo značku (napr. pri hľadaní lampového '65 Deluxe Reverb vyraď digitálnu verziu Tone Master, ak používateľ hľadá konkrétne 65 Deluxe Reverb), prípadne inzerát porušuje obmedzenie v poznámke.
+    - "matched_item_name": Čistý rozpoznaný názov modelu v inzeráte.
+    - "reason": Krátke zhrnutie v slovenčine (1 veta, napr. "Predaj gitarového komba Fender '65 Deluxe Reverb").
     """
 
     for attempt in range(3):
