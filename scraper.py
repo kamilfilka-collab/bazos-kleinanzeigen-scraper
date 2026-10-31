@@ -21,14 +21,6 @@ WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
 
-# Každý model má vo Free Tieri vlastnú samostatnú kvótu 20 dotazov/deň!
-# Ak prvý model vyčerpá dennú kvótu (429) alebo je preťažený (503), okamžite prevezme prácu ďalší model.
-GEMINI_MODELS = [
-    "gemini-3.8-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-2.5-flash",
-]
-
 if not GEMINI_API_KEY:
     raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets.")
 
@@ -97,6 +89,35 @@ def parse_euro_price(raw_text: str) -> float | None:
         return None
 
 
+def get_available_gemini_models() -> list[str]:
+    """
+    Zistí priamo z Google API zoznam všetkých modelov dostupných pre tvoj API kľúč,
+    aby pri vyčerpaní denného limitu (20 req/deň na gemini-3.8-flash) mohol použiť
+    ďalší funkčný model z tvojho účtu.
+    """
+    preferred = ["gemini-3.8-flash"]
+    try:
+        discovered = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            short_name = name.replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if any(bad in short_name.lower() for bad in ("embedding", "imagen", "veo", "tts", "audio", "robotics", "aqa", "learnlm")):
+                continue
+            if ("gemini" in short_name.lower() or "gemma" in short_name.lower()):
+                if not actions or "generateContent" in str(actions):
+                    discovered.append(short_name)
+
+        print(f"Dostupné AI modely na tvojom kľúči: {discovered}", flush=True)
+        for d in discovered:
+            if d not in preferred:
+                preferred.append(d)
+    except Exception as e:
+        print(f"Nepodarilo sa načítať zoznam modelov: {e}", flush=True)
+
+    return preferred
+
+
 def build_search_queries(item: str) -> list[str]:
     """
     Lokálne (bez míňania Gemini API limitu!) vytvorí z položky vo watchlist.txt
@@ -106,7 +127,6 @@ def build_search_queries(item: str) -> list[str]:
     base = re.sub(r"\(.*?\)", "", item).strip()
     queries = []
 
-    # Skrátený výraz bez "MK II", "MK 2", ročníkov "65", "1966", "MIJ" atď.
     simplified = re.sub(
         r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2}|19\d{2}|reissue|mij|cij)\b",
         "",
@@ -308,8 +328,6 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
 # 3. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
 # ==========================================
 def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
-    # Ak Mercatino nenašlo žiadny inzerát, vypíše "La tua ricerca non ha prodotto risultati"
-    # a pod tým zobrazí náhodné reklamy z celého webu – tie musíme preskočiť!
     if "La tua ricerca non ha prodotto risultati" in html_text or "boxmsg_warn" in html_text:
         return []
 
@@ -410,29 +428,38 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
     - "reason": Krátke vysvetlenie v slovenčine (max 8 slov).
     """
 
-    for model_name in GEMINI_MODELS:
+    available_models = get_available_gemini_models()
+
+    for model_name in available_models:
         for attempt in range(2):
             try:
                 print(
                     f"Posielam všetky inzeráty ({len(ads)} ks) naraz do AI ({model_name}, pokus {attempt + 1}/2)...",
                     flush=True,
                 )
+                cfg = (
+                    types.GenerateContentConfig(temperature=0.1)
+                    if "gemma" in model_name.lower()
+                    else types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    )
+                )
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
+                    config=cfg,
                 )
-                parsed_list = json.loads(response.text)
+                raw_text = response.text.strip()
+                if raw_text.startswith("```"):
+                    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.DOTALL).strip()
+                parsed_list = json.loads(raw_text)
                 return {str(item.get("id")): item for item in parsed_list}
             except Exception as e:
                 err_str = str(e)
                 print(f" -> [{model_name} pokus {attempt + 1}/2 zlyhal]: {e}", flush=True)
-                # Ak má daný model vyčerpaný denný limit (429) alebo neexistuje (404), hneď prejdeme na ďalší model!
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str:
-                    print(f" -> Prepínam na ďalší model v poradí...", flush=True)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str or "NOT_FOUND" in err_str or "400" in err_str:
+                    print(" -> Prepínam na ďalší dostupný model...", flush=True)
                     break
                 time.sleep(12)
 
