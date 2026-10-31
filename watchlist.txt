@@ -10,7 +10,7 @@
 # - Voliteľne môžeš uviesť aj spresnenie alebo max cenu (AI v Gemini si to prečíta!).
 # ==============================================================================
 
-V40 Duchess MK II
+Victory V40 Duchess MK II
 Fender 65 Deluxe Reverb
 Fender American Vintage II 1966 Jazzmaster
 Fender MIJ Troublemaker Telecaster
