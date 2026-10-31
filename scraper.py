@@ -21,7 +21,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
-GEMINI_MODEL = "gemini-3.8-flash"
+
+# Zoznam modelov od primárneho po záložné (ak má hlavný model 503 High Demand)
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-lite",
+    "gemini-3.8-pro",
+    "gemini-2.5-pro",
+]
 
 if not GEMINI_API_KEY:
     raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets alebo v prostredí.")
@@ -91,6 +98,55 @@ def parse_euro_price(raw_text: str) -> float | None:
         return None
 
 
+def call_gemini_json(prompt: str) -> list | dict | None:
+    """Zavolá Gemini API a pri preťažení (503) automaticky vyskúša záložné modely."""
+    for attempt in range(3):
+        for model_name in GEMINI_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                return json.loads(response.text)
+            except Exception as e:
+                err_str = str(e)
+                # Ak model neexistuje (404), hneď skúsime ďalší v zozname
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    continue
+                print(f" -> [Gemini {model_name} pokus {attempt + 1}/3]: {e}")
+                time.sleep(3)
+        time.sleep(8)
+    return None
+
+
+def build_smart_fallback_queries(item: str) -> list[str]:
+    """
+    Ak je AI nedostupná, vytvorí okrem plného názvu aj skrátený variant bez
+    označení ako MK II, MK2, '65, 65, atď., aby Bazoš a Kleinanzeigen našli viac zhôd.
+    """
+    base = re.sub(r"\(.*?\)", "", item).strip()
+    queries = [base]
+
+    # Odstránime "MK II", "MKII", "MK 2", alebo samostatné dvojciferné ročníky ako "65"
+    simplified = re.sub(r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2})\b", "", base, flags=re.IGNORECASE)
+    simplified = re.sub(r"\s+", " ", simplified).strip(" -")
+    if simplified and simplified.lower() != base.lower() and len(simplified) >= 3:
+        queries.append(simplified)
+
+    # Ak je tam pomlčka (napr. DDJ-400), pridáme aj verziu s medzerou
+    if "-" in base:
+        no_dash = base.replace("-", " ")
+        no_dash = re.sub(r"\s+", " ", no_dash).strip()
+        if no_dash not in queries:
+            queries.append(no_dash)
+
+    return queries[:3]
+
+
 # ==========================================
 # 1. AI GENEROVANIE HĽADACÍCH VÝRAZOV (AJ S PREKLEPMI)
 # ==========================================
@@ -110,26 +166,17 @@ def generate_search_queries_with_ai(watchlist: list[str]) -> list[dict]:
 
     Vráť čisto JSON pole.
     """
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            print(f"[AI Generovanie výrazov - pokus {attempt + 1}/3 zlyhal]: {e}")
-            time.sleep(5)
+    parsed = call_gemini_json(prompt)
+    if isinstance(parsed, list) and parsed:
+        return parsed
 
-    # Záložné riešenie, ak by AI neodpovedala
+    print(" -> Používam lokálne generovanie vyhľadávacích výrazov (záložný režim).")
     fallback = []
     for item in watchlist:
-        clean_q = re.sub(r"\(.*?\)", "", item).strip()
-        fallback.append({"target_item": item, "queries": [clean_q]})
+        fallback.append({
+            "target_item": item,
+            "queries": build_smart_fallback_queries(item),
+        })
     return fallback
 
 
@@ -220,13 +267,12 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
     rss_base = f"https://www.bazos.sk/rss.php?hledat={encoded_q}"
     rss_candidates = [
         rss_base,
-        f"https://api.allorigins.win/raw?url={quote_plus(rss_base)}",
         f"https://corsproxy.io/?{quote_plus(rss_base)}",
     ]
 
     for url in rss_candidates:
         try:
-            r = requests.get(url, headers=headers, timeout=12)
+            r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200 and "<rss" in r.text:
                 ads = parse_bazos_rss_xml(r.text, target_item)
                 return ads
@@ -236,7 +282,7 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
     # Záložné HTML vyhľadávanie, ak by RSS nefungovalo
     html_url = f"https://www.bazos.sk/search.php?hledat={encoded_q}"
     try:
-        r = requests.get(html_url, headers=headers, timeout=12)
+        r = requests.get(html_url, headers=headers, timeout=10)
         if r.status_code == 200:
             return parse_bazos_html(r.text, target_item)
     except Exception as e:
@@ -251,14 +297,12 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
     soup = BeautifulSoup(html_text, "html.parser")
-    # Kleinanzeigen používa atribút data-adid na značke <article>
     articles = soup.select("article[data-adid], article.aditem")
 
     for art in articles:
         data_id = art.get("data-adid")
         href = art.get("data-href") or ""
 
-        # Názov a popis môžeme získať z vloženého JSON-LD alebo priamo z HTML elementov
         title = ""
         desc = ""
         ld_script = art.select_one('script[type="application/ld+json"]')
@@ -316,7 +360,6 @@ def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
 
 
 def fetch_kleinanzeigen_for_query(query: str, target_item: str, browser_context) -> list[dict]:
-    # Kleinanzeigen URL vyhľadávanie používa pomlčky namiesto medzier
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", query.strip().lower()).strip("-")
     if not slug:
         return []
@@ -356,9 +399,40 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str, browser_context)
 
 
 # ==========================================
-# 4. HROMADNÁ AI ANALÝZA INZERÁTOV (GEMINI)
+# 4. HROMADNÁ AI ANALÝZA INZERÁTOV (GEMINI + ZÁLOŽNÝ FILTER)
 # ==========================================
-def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict] | None:
+def verify_ads_fallback_locally(ads: list[dict]) -> dict[str, dict]:
+    """
+    Záložné vyhodnotenie inzerátov v prípade, že sú všetky modely Google Gemini
+    dočasne preťažené (chyba 503). Vyradí očividné dopyty a obaly/príslušenstvo.
+    """
+    bad_keywords = [
+        "kúpim", "kupim", "hľadám", "hladam", "suche", "kaufe",
+        "flightcase", "case", "cover", "hülle", "abdeckung", "tasche",
+        "leerkarton", "karton", "ovp", "footswitch", "fußschalter",
+        "röhre", "tubes", "speaker", "ersatzteil",
+    ]
+    results = {}
+    for ad in ads:
+        text_lower = f"{ad['title']} {ad['description']}".lower()
+        if any(bad in text_lower for bad in bad_keywords):
+            results[str(ad["id"])] = {
+                "id": ad["id"],
+                "is_match": False,
+                "matched_item_name": ad["target_item"],
+                "reason": "Vyradené lokálnym filtrom (príslušenstvo / dopyt)",
+            }
+        else:
+            results[str(ad["id"])] = {
+                "id": ad["id"],
+                "is_match": True,
+                "matched_item_name": ad["target_item"],
+                "reason": "Nájdená zhoda (overené záložným filtrom počas výpadku AI)",
+            }
+    return results
+
+
+def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict]:
     """
     Pošle nájdené inzeráty do Gemini AI, aby vyfiltrovala:
     - či inzerát naozaj predáva hľadanú položku z watchlistu (aj keď má v názve preklep)
@@ -394,24 +468,13 @@ def verify_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str,
     - "reason": Krátke zhrnutie v slovenčine (1 veta, napr. "Predaj gitarového komba Fender '65 Deluxe Reverb").
     """
 
-    for attempt in range(3):
-        try:
-            print(f"Posielam dávku {len(ads)} inzerátov do Gemini AI na kontrolu...")
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            parsed_list = json.loads(response.text)
-            return {str(item.get("id")): item for item in parsed_list}
-        except Exception as e:
-            print(f"[AI Analýza pokus {attempt + 1}/3 zlyhal]: {e}")
-            time.sleep(10)
+    print(f"Posielam dávku {len(ads)} inzerátov do Gemini AI na kontrolu...")
+    parsed_list = call_gemini_json(prompt)
+    if isinstance(parsed_list, list):
+        return {str(item.get("id")): item for item in parsed_list}
 
-    return None
+    print(" -> Všetky Gemini modely sú momentálne vyťažené (503), používam záložný lokálny filter.")
+    return verify_ads_fallback_locally(ads)
 
 
 # ==========================================
@@ -525,10 +588,6 @@ def main():
     for i in range(0, len(new_ads), batch_size):
         batch = new_ads[i : i + batch_size]
         ai_results = verify_ads_batch_with_ai(batch, watchlist)
-
-        if ai_results is None:
-            print("AI analýza pre túto dávku zlyhala, inzeráty skontrolujem pri ďalšom behu.")
-            continue
 
         for ad in batch:
             seen_ads.add(ad["id"])
