@@ -20,14 +20,21 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
-GEMINI_MODEL = "gemini-3.8-flash"
+
+# Každý model má vo Free Tieri vlastnú samostatnú kvótu 20 dotazov/deň!
+# Ak prvý model vyčerpá dennú kvótu (429) alebo je preťažený (503), okamžite prevezme prácu ďalší model.
+GEMINI_MODELS = [
+    "gemini-3.8-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+]
 
 if not GEMINI_API_KEY:
     raise ValueError("Chýba GEMINI_API_KEY! Nastav ho v GitHub Secrets.")
 
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=30000),
+    http_options=types.HttpOptions(timeout=45000),
 )
 
 
@@ -93,15 +100,15 @@ def parse_euro_price(raw_text: str) -> float | None:
 def build_search_queries(item: str) -> list[str]:
     """
     Lokálne (bez míňania Gemini API limitu!) vytvorí z položky vo watchlist.txt
-    vyhľadávacie výrazy vrátane širšieho výrazu bez označení ako MK II, 65, '65,
+    vyhľadávacie výrazy vrátane širšieho výrazu bez označení ako MK II, 65, MIJ, 1966,
     aby vyhľadávače našli aj inzeráty, kde predávajúci tieto detaily nenapísal.
     """
     base = re.sub(r"\(.*?\)", "", item).strip()
     queries = []
 
-    # Skrátený výraz bez "MK II", "MK 2", ročníkov "65", "1966" atď.
+    # Skrátený výraz bez "MK II", "MK 2", ročníkov "65", "1966", "MIJ" atď.
     simplified = re.sub(
-        r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2}|19\d{2}|reissue)\b",
+        r"\b(?:mk\s*(?:ii|2|i|iii|3)|'?\d{2}|19\d{2}|reissue|mij|cij)\b",
         "",
         base,
         flags=re.IGNORECASE,
@@ -113,7 +120,6 @@ def build_search_queries(item: str) -> list[str]:
     if base not in queries:
         queries.append(base)
 
-    # Ak názov obsahuje pomlčku (napr. DDJ-400), pridáme aj verziu s medzerou
     if "-" in base:
         no_dash = re.sub(r"\s+", " ", base.replace("-", " ")).strip()
         if no_dash not in queries:
@@ -272,7 +278,7 @@ def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
             "portal": "Kleinanzeigen.de",
             "target_item": target_item,
             "title": title,
-            "description": desc,
+            "description": desc[:200],
             "price": price,
             "price_text": price_raw if price_raw else "VB / Dohodou",
             "url": link,
@@ -302,6 +308,11 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
 # 3. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
 # ==========================================
 def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
+    # Ak Mercatino nenašlo žiadny inzerát, vypíše "La tua ricerca non ha prodotto risultati"
+    # a pod tým zobrazí náhodné reklamy z celého webu – tie musíme preskočiť!
+    if "La tua ricerca non ha prodotto risultati" in html_text or "boxmsg_warn" in html_text:
+        return []
+
     ads = []
     soup = BeautifulSoup(html_text, "html.parser")
     for box in soup.select("div.box_prod"):
@@ -310,7 +321,6 @@ def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
             continue
 
         href = link_el.get("href", "")
-        # Ignorujeme platené externé reklamy na e-shopy, berieme len skutočné inzeráty (/mm/a_...)
         if not href or ("/mm/" not in href and "mercatinomusicale.com/mm/" not in href):
             continue
 
@@ -341,13 +351,12 @@ def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
             "portal": "MercatinoMusicale.com",
             "target_item": target_item,
             "title": title,
-            "description": desc[:250],
+            "description": desc[:200],
             "price": price,
             "price_text": price_text,
             "url": link,
         })
-    # Zoberieme prvých 20 najnovších inzerátov na jeden výraz
-    return ads[:20]
+    return ads[:15]
 
 
 def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
@@ -367,7 +376,7 @@ def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 4. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE AKO V PÔVODNOM KÓDE)
+# 4. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE)
 # ==========================================
 def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict] | None:
     items_for_prompt = [
@@ -377,7 +386,7 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
             "searched_for": a["target_item"],
             "title": a["title"],
             "price": a["price_text"],
-            "description": a["description"][:250],
+            "description": a["description"][:180],
         }
         for a in ads
     ]
@@ -401,23 +410,31 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
     - "reason": Krátke vysvetlenie v slovenčine (max 8 slov).
     """
 
-    for attempt in range(4):
-        try:
-            print(f"Posielam všetky inzeráty ({len(ads)} ks) naraz v 1 dotaze do Gemini AI...", flush=True)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            parsed_list = json.loads(response.text)
-            return {str(item.get("id")): item for item in parsed_list}
-        except Exception as e:
-            print(f"[AI Pokus {attempt + 1}/4 zlyhal]: {e}", flush=True)
-            # Počkáme 15 sekúnd pred ďalším pokusom (kvôli 5 RPM limitu a špičkám)
-            time.sleep(15)
+    for model_name in GEMINI_MODELS:
+        for attempt in range(2):
+            try:
+                print(
+                    f"Posielam všetky inzeráty ({len(ads)} ks) naraz do AI ({model_name}, pokus {attempt + 1}/2)...",
+                    flush=True,
+                )
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                parsed_list = json.loads(response.text)
+                return {str(item.get("id")): item for item in parsed_list}
+            except Exception as e:
+                err_str = str(e)
+                print(f" -> [{model_name} pokus {attempt + 1}/2 zlyhal]: {e}", flush=True)
+                # Ak má daný model vyčerpaný denný limit (429) alebo neexistuje (404), hneď prejdeme na ďalší model!
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str:
+                    print(f" -> Prepínam na ďalší model v poradí...", flush=True)
+                    break
+                time.sleep(12)
 
     return None
 
@@ -513,7 +530,6 @@ def main():
     if not new_ads:
         return
 
-    # Presne ako v tvojom pôvodnom scraperi: VŠETKY inzeráty pošleme v 1 jedinom volaní do Gemini AI!
     ai_results = parse_ads_batch_with_ai(new_ads, watchlist)
     if ai_results is None:
         print("AI analýza momentálne zlyhala, inzeráty neoznačujem ako videné a skúsim pri ďalšom behu.", flush=True)
