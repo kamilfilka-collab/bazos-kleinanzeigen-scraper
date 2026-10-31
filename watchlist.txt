@@ -1,0 +1,17 @@
+# ==============================================================================
+# ZOZNAM HĽADANÝCH POLOŽIEK (Bazoš.sk + Kleinanzeigen.de)
+# ==============================================================================
+# Ako tento súbor používať:
+# - Každý riadok je 1 hľadaná položka.
+# - Riadky začínajúce znakom # sú komentáre (skript ich ignoruje).
+# - Prázdne riadky sa ignorujú.
+# - Ak chceš niečo pridať, jednoducho napíš názov položky na nový riadok.
+# - Ak chceš niečo vymazať, zmaž riadok (alebo pred neho daj znak #).
+# - Voliteľne môžeš uviesť aj spresnenie alebo max cenu (AI v Gemini si to prečíta!).
+# ==============================================================================
+
+Pioneer DDJ-400
+Fender Stratocaster (Mexiko alebo USA, nie Squier)
+Yamaha PSR-E443
+Shure SM7B
+Boss RC-505 Loop Station
