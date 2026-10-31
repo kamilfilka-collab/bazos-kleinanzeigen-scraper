@@ -10,8 +10,5 @@
 # - Voliteľne môžeš uviesť aj spresnenie alebo max cenu (AI v Gemini si to prečíta!).
 # ==============================================================================
 
-Pioneer DDJ-400
-Fender Stratocaster (Mexiko alebo USA, nie Squier)
-Yamaha PSR-E443
-Shure SM7B
-Boss RC-505 Loop Station
+V40 Duchess MK II
+Fender 65 Deluxe Reverb
