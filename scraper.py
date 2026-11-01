@@ -248,7 +248,81 @@ def fetch_bazos_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 2. SŤAHOVANIE KLEINANZEIGEN.DE
+# 2. SŤAHOVANIE HUDEBNIBAZAR.CZ (ČESKO + SLOVENSKO)
+# ==========================================
+def parse_hudebnibazar_html(html_text: str, target_item: str) -> list[dict]:
+    ads = []
+    soup = BeautifulSoup(html_text, "html.parser")
+    for card in soup.select("div.InzeratBody.InzeratCard"):
+        inz_id = card.get("data-inzid")
+        content_el = card.select_one("div.InzeratContent")
+        if not content_el:
+            continue
+
+        link_el = content_el.select_one("a[href]")
+        href = link_el.get("href", "") if link_el else ""
+        if not href and not inz_id:
+            continue
+
+        link = f"https://hudebnibazar.cz{href}" if href.startswith("/") else href
+        ad_id = f"hb_{inz_id}" if inz_id else f"hb_{link}"
+
+        nadpis_el = content_el.select_one("div.InzeratNadpis")
+        title = nadpis_el.get_text(" ", strip=True) if nadpis_el else ""
+        if not title:
+            btn_el = card.select_one("button[data-inznazev]")
+            title = btn_el.get("data-inznazev", "").strip() if btn_el else ""
+        if not title:
+            continue
+
+        text_el = content_el.select_one("div.InzeratText")
+        desc = text_el.get_text(" ", strip=True) if text_el else ""
+
+        cena_eur_el = content_el.select_one("span.InzeratCenaEUR")
+        cena_el = content_el.select_one("div.InzeratCena")
+        price = None
+        price_text = "Dohodou"
+
+        if cena_eur_el:
+            eur_raw = cena_eur_el.get_text(" ", strip=True)
+            price = parse_euro_price(eur_raw)
+        if cena_el:
+            raw_full = cena_el.get_text(" ", strip=True)
+            if raw_full:
+                price_text = raw_full
+
+        ads.append({
+            "id": ad_id,
+            "portal": "HudebniBazar.cz",
+            "target_item": target_item,
+            "title": title,
+            "description": desc[:200],
+            "price": price,
+            "price_text": price_text,
+            "url": link,
+        })
+    return ads[:15]
+
+
+def fetch_hudebnibazar_for_query(query: str, target_item: str) -> list[dict]:
+    encoded_q = quote_plus(query)
+    # n=nabidka filtruje rovno iba predaj ("prodám") a o=nove zoraďuje od najnovších
+    url = f"https://hudebnibazar.cz/?is=1&p=1&f={encoded_q}&kat=0&n=nabidka&o=nove"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "cs-CZ,cs;q=0.9,sk;q=0.8,en;q=0.7",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200 and "InzeratCard" in r.text:
+            return parse_hudebnibazar_html(r.text, target_item)
+    except Exception as e:
+        print(f" -> HudebniBazar.cz pokus zlyhal pre '{query}': {e}", flush=True)
+    return []
+
+
+# ==========================================
+# 3. SŤAHOVANIE KLEINANZEIGEN.DE (NEMECKO)
 # ==========================================
 def parse_kleinanzeigen_html(html_text: str, target_item: str) -> list[dict]:
     ads = []
@@ -325,7 +399,7 @@ def fetch_kleinanzeigen_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 3. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
+# 4. SŤAHOVANIE MERCATINOMUSICALE.COM (TALIANSKO)
 # ==========================================
 def parse_mercatino_html(html_text: str, target_item: str) -> list[dict]:
     if "La tua ricerca non ha prodotto risultati" in html_text or "boxmsg_warn" in html_text:
@@ -394,7 +468,7 @@ def fetch_mercatino_for_query(query: str, target_item: str) -> list[dict]:
 
 
 # ==========================================
-# 4. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE)
+# 5. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE)
 # ==========================================
 def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, dict] | None:
     items_for_prompt = [
@@ -410,7 +484,7 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
     ]
 
     prompt = f"""
-    Analyzuj tento zoznam inzerátov z portálov Bazoš.sk, Kleinanzeigen.de a MercatinoMusicale.com.
+    Analyzuj tento zoznam inzerátov z portálov Bazoš.sk, HudebniBazar.cz, Kleinanzeigen.de a MercatinoMusicale.com.
     Používateľ hľadá tieto položky:
     {json.dumps(watchlist, ensure_ascii=False)}
 
@@ -422,8 +496,8 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
     - "is_match": true ak ide o predaj hľadanej položky (pole "searched_for" alebo inej položky zo zoznamu používateľa).
       DÔLEŽITÉ PRAVIDLÁ:
       1. Ľudia robia preklepy (napr. "delux reverb") alebo nepíšu celé označenie verzie (napr. pri hľadaní "V40 Duchess MK II" vezmi ako true aj "Victory V40 The Duchess" alebo "Victory V40 Duchess", a pri "Fender 65 Deluxe Reverb" vezmi aj "Fender Deluxe Reverb").
-      2. Ak je v názve uvedené "inkl. Gigbag", "mit Cover", "con custodia", "inkl. Footswitch", ide o predaj samotného zosilňovača/nástroja aj s obalom -> daj true!
-      3. Daj false, ak ide o dopyt ("Kúpim", "Suche", "Cerco"), prenájom, výmenu, samotný prázdny obal/kufor/krabicu bez prístroja, samotný reproduktor alebo úplne iný prístroj (napr. krabičkový pedál Boss FDR-1 namiesto komba Fender, alebo Orange Rockerverb).
+      2. Ak je v názve uvedené "inkl. Gigbag", "mit Cover", "con custodia", "inkl. Footswitch", "včetně obalu", ide o predaj samotného zosilňovača/nástroja aj s obalom -> daj true!
+      3. Daj false, ak ide o dopyt ("Kúpim", "Koupím", "Suche", "Cerco"), prenájom, výmenu, samotný prázdny obal/kufor/krabicu bez prístroja, samotný reproduktor alebo úplne iný prístroj (napr. krabičkový pedál Boss FDR-1 namiesto komba Fender, alebo Orange Rockerverb).
     - "matched_item_name": Presný názov rozpoznaného modelu v inzeráte.
     - "reason": Krátke vysvetlenie v slovenčine (max 8 slov).
     """
@@ -467,7 +541,7 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
 
 
 # ==========================================
-# 5. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
+# 6. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
 # ==========================================
 def save_and_notify(ad: dict, ai_info: dict):
     file_exists = os.path.isfile(CSV_OUTPUT)
@@ -535,14 +609,21 @@ def main():
                 if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
                     collected_ads_by_id[ad["id"]] = ad
 
-            # 2. Kleinanzeigen.de
+            # 2. HudebniBazar.cz
+            hb_ads = fetch_hudebnibazar_for_query(q, target_item)
+            print(f" -> [HudebniBazar.cz] '{q}': nájdených {len(hb_ads)} inzerátov", flush=True)
+            for ad in hb_ads:
+                if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
+                    collected_ads_by_id[ad["id"]] = ad
+
+            # 3. Kleinanzeigen.de
             ka_ads = fetch_kleinanzeigen_for_query(q, target_item)
             print(f" -> [Kleinanzeigen.de] '{q}': nájdených {len(ka_ads)} inzerátov", flush=True)
             for ad in ka_ads:
                 if ad["id"] not in seen_ads and ad["id"] not in collected_ads_by_id:
                     collected_ads_by_id[ad["id"]] = ad
 
-            # 3. MercatinoMusicale.com
+            # 4. MercatinoMusicale.com
             mm_ads = fetch_mercatino_for_query(q, target_item)
             print(f" -> [MercatinoMusicale.com] '{q}': nájdených {len(mm_ads)} inzerátov", flush=True)
             for ad in mm_ads:
