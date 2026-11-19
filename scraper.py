@@ -14,9 +14,13 @@ import requests
 # ==========================================
 # KONFIGURÁCIA (Načítanie z GitHub Secrets)
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+# Ak používateľ omylom vložil token aj so slovom "bot" na začiatku (napr. "bot123456:ABC"), očistíme ho
+if TELEGRAM_BOT_TOKEN.lower().startswith("bot") and ":" in TELEGRAM_BOT_TOKEN:
+    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[3:].strip()
 
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
@@ -30,6 +34,66 @@ client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(timeout=45000),
 )
+
+
+# ==========================================
+# TELEGRAM DIAGNOSTIKA A ODOSIELANIE
+# ==========================================
+def send_telegram_message(text: str) -> bool:
+    """Odošle správu na Telegram a vypíše presnú odpoveď servera pri chybe."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(
+            f" -> [Telegram PRESKOČENÝ]: Token nastavený={bool(TELEGRAM_BOT_TOKEN)}, Chat ID nastavené={bool(TELEGRAM_CHAT_ID)}",
+            flush=True,
+        )
+        return False
+
+    tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(
+            tg_url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            print(" -> [Telegram OK]: Správa bola úspešne doručená na Telegram.", flush=True)
+            return True
+        else:
+            print(f" -> [Telegram CHYBA HTTP {r.status_code}]: {r.text}", flush=True)
+            return False
+    except Exception as e:
+        print(f" -> [Telegram VÝNIMKA]: {e}", flush=True)
+        return False
+
+
+def check_telegram_setup():
+    """Skontroluje nastavenie Telegram bota pri štarte skriptu."""
+    print("=== KONTROLA TELEGRAM NASTAVENÍ ===", flush=True)
+    if not TELEGRAM_BOT_TOKEN:
+        print(" [!] TELEGRAM_BOT_TOKEN je prázdny! Skontroluj GitHub Secrets (Settings -> Secrets and variables -> Actions).", flush=True)
+    else:
+        masked_token = TELEGRAM_BOT_TOKEN[:6] + "..." + TELEGRAM_BOT_TOKEN[-4:] if len(TELEGRAM_BOT_TOKEN) > 10 else "***"
+        print(f" [OK] TELEGRAM_BOT_TOKEN načítaný ({masked_token})", flush=True)
+
+    if not TELEGRAM_CHAT_ID:
+        print(" [!] TELEGRAM_CHAT_ID je prázdny! Skontroluj GitHub Secrets.", flush=True)
+    else:
+        print(f" [OK] TELEGRAM_CHAT_ID načítané ({TELEGRAM_CHAT_ID})", flush=True)
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10)
+            if r.status_code == 200:
+                bot_info = r.json().get("result", {})
+                print(
+                    f" [OK] Bot overený: @{bot_info.get('username')} ({bot_info.get('first_name')})",
+                    flush=True,
+                )
+            else:
+                print(f" [!] Neplatný TELEGRAM_BOT_TOKEN! Odpoveď Telegramu: {r.text}", flush=True)
+        except Exception as e:
+            print(f" [!] Chyba pri overovaní bota: {e}", flush=True)
+    print("===================================\n", flush=True)
 
 
 # ==========================================
@@ -63,10 +127,6 @@ def save_seen_ads(seen_set: set[str]):
 
 
 def get_item_csv_path(target_item: str) -> str:
-    """
-    Pre každú hľadanú položku vytvorí vlastný názov CSV súboru v priečinku vysledky/
-    (napr. 'Fender 65 Deluxe Reverb' -> 'vysledky/Fender_65_Deluxe_Reverb.csv').
-    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     normalized = unicodedata.normalize("NFKD", target_item)
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
@@ -77,7 +137,6 @@ def get_item_csv_path(target_item: str) -> str:
 
 
 def write_deal_to_csv(csv_path: str, row_data: list):
-    """Zapíše riadok s nájdeným inzerátom do zvoleného CSV súboru (ak neexistuje, pridá hlavičku)."""
     file_exists = os.path.isfile(csv_path)
     with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -119,11 +178,6 @@ def parse_euro_price(raw_text: str) -> float | None:
 
 
 def get_available_gemini_models() -> list[str]:
-    """
-    Zistí priamo z Google API zoznam všetkých modelov dostupných pre tvoj API kľúč,
-    aby pri vyčerpaní denného limitu (20 req/deň na gemini-3.8-flash) mohol použiť
-    ďalší funkčný model z tvojho účtu.
-    """
     preferred = ["gemini-3.8-flash"]
     try:
         discovered = []
@@ -148,11 +202,6 @@ def get_available_gemini_models() -> list[str]:
 
 
 def build_search_queries(item: str) -> list[str]:
-    """
-    Lokálne (bez míňania Gemini API limitu!) vytvorí z položky vo watchlist.txt
-    vyhľadávacie výrazy vrátane širšieho výrazu bez označení ako MK II, 65, MIJ, 1966,
-    aby vyhľadávače našli aj inzeráty, kde predávajúci tieto detaily nenapísal.
-    """
     base = re.sub(r"\(.*?\)", "", item).strip()
     queries = []
 
@@ -583,11 +632,8 @@ def save_and_notify(ad: dict, ai_info: dict):
         ad["url"],
     ]
 
-    # 1. Uložíme do samostatného CSV súboru pre konkrétnu hľadanú položku (v priečinku vysledky/)
     item_csv_path = get_item_csv_path(ad["target_item"])
     write_deal_to_csv(item_csv_path, row_data)
-
-    # 2. Uložíme aj do spoločného súboru najdene_inzeraty.csv (pre celkový prehľad)
     write_deal_to_csv(CSV_OUTPUT, row_data)
 
     msg = (
@@ -599,20 +645,22 @@ def save_and_notify(ad: dict, ai_info: dict):
         f"📂 Súbor: {item_csv_path}\n"
         f"🔗 Link: {ad['url']}"
     )
-    print("\n" + msg + "\n", flush=True)
-
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            requests.post(tg_url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-        except Exception as e:
-            print(f"Chyba pri odosielaní na Telegram: {e}", flush=True)
+    print("\n" + msg, flush=True)
+    send_telegram_message(msg)
 
 
 # ==========================================
 # HLAVNÝ PROGRAM
 # ==========================================
 def main():
+    check_telegram_setup()
+
+    # Ak používateľ spúšťa workflow manuálne cez tlačidlo "Run workflow" na GitHube,
+    # pošleme krátku testovaciu správu, aby si hneď videl, že Telegram funguje!
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        print("Manuálne spustenie (workflow_dispatch) -> posielam testovaciu správu na Telegram...", flush=True)
+        send_telegram_message("✅ Test: Tvoj AI Scraper na GitHube práve beží a spojenie s Telegramom funguje!")
+
     watchlist = load_watchlist()
     if not watchlist:
         print(f"Zoznam {WATCHLIST_FILE} je prázdny.", flush=True)
