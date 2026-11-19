@@ -2,8 +2,9 @@ name: Bazos & Kleinanzeigen AI Scraper
 
 on:
   schedule:
+    # Spúšťa sa automaticky každú hodinu (v 15. minúte)
     - cron: '15 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Umožňuje manuálne spustenie tlačidlom "Run workflow" na GitHube
 
 permissions:
   contents: write
@@ -25,7 +26,6 @@ jobs:
       - name: Inštalácia knižníc
         run: |
           pip install -r requirements.txt
-          playwright install --with-deps chromium
 
       - name: Spustenie scrapera
         env:
@@ -38,6 +38,6 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_ads.txt najdene_inzeraty.csv || true
+          git add seen_ads.txt najdene_inzeraty.csv vysledky/ || true
           git diff --staged --quiet || git commit -m "Aktualizácia inzerátov [skip ci]"
           git push
