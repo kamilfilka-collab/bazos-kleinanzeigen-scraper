@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
@@ -19,6 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 WATCHLIST_FILE = "watchlist.txt"
 CSV_OUTPUT = "najdene_inzeraty.csv"
+RESULTS_DIR = "vysledky"
 SEEN_FILE = "seen_ads.txt"
 
 if not GEMINI_API_KEY:
@@ -58,6 +60,33 @@ def save_seen_ads(seen_set: set[str]):
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         for ad_id in recent_ads:
             f.write(f"{ad_id}\n")
+
+
+def get_item_csv_path(target_item: str) -> str:
+    """
+    Pre každú hľadanú položku vytvorí vlastný názov CSV súboru v priečinku vysledky/
+    (napr. 'Fender 65 Deluxe Reverb' -> 'vysledky/Fender_65_Deluxe_Reverb.csv').
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    normalized = unicodedata.normalize("NFKD", target_item)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", ascii_text).strip("_")
+    if not safe_name:
+        safe_name = "polozka"
+    return os.path.join(RESULTS_DIR, f"{safe_name}.csv")
+
+
+def write_deal_to_csv(csv_path: str, row_data: list):
+    """Zapíše riadok s nájdeným inzerátom do zvoleného CSV súboru (ak neexistuje, pridá hlavičku)."""
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "Dátum", "Portál", "Hľadaná položka", "Rozpoznaný model",
+                "Názov inzerátu", "Cena", "AI Poznámka", "URL",
+            ])
+        writer.writerow(row_data)
 
 
 def parse_euro_price(raw_text: str) -> float | None:
@@ -306,7 +335,6 @@ def parse_hudebnibazar_html(html_text: str, target_item: str) -> list[dict]:
 
 def fetch_hudebnibazar_for_query(query: str, target_item: str) -> list[dict]:
     encoded_q = quote_plus(query)
-    # n=nabidka filtruje rovno iba predaj ("prodám") a o=nove zoraďuje od najnovších
     url = f"https://hudebnibazar.cz/?is=1&p=1&f={encoded_q}&kat=0&n=nabidka&o=nove"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -541,27 +569,26 @@ def parse_ads_batch_with_ai(ads: list[dict], watchlist: list[str]) -> dict[str, 
 
 
 # ==========================================
-# 6. ULOŽENIE A NOTIFIKÁCIA (CSV + TELEGRAM)
+# 6. ULOŽENIE A NOTIFIKÁCIA (SAMOSTATNÉ CSV PRE KAŽDÚ POLOŽKU + TELEGRAM)
 # ==========================================
 def save_and_notify(ad: dict, ai_info: dict):
-    file_exists = os.path.isfile(CSV_OUTPUT)
-    with open(CSV_OUTPUT, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "Dátum", "Portál", "Hľadaná položka", "Rozpoznaný model",
-                "Názov inzerátu", "Cena", "AI Poznámka", "URL",
-            ])
-        writer.writerow([
-            time.strftime("%Y-%m-%d %H:%M"),
-            ad["portal"],
-            ad["target_item"],
-            ai_info.get("matched_item_name") or ad["target_item"],
-            ad["title"],
-            ad["price_text"],
-            ai_info.get("reason", ""),
-            ad["url"],
-        ])
+    row_data = [
+        time.strftime("%Y-%m-%d %H:%M"),
+        ad["portal"],
+        ad["target_item"],
+        ai_info.get("matched_item_name") or ad["target_item"],
+        ad["title"],
+        ad["price_text"],
+        ai_info.get("reason", ""),
+        ad["url"],
+    ]
+
+    # 1. Uložíme do samostatného CSV súboru pre konkrétnu hľadanú položku (v priečinku vysledky/)
+    item_csv_path = get_item_csv_path(ad["target_item"])
+    write_deal_to_csv(item_csv_path, row_data)
+
+    # 2. Uložíme aj do spoločného súboru najdene_inzeraty.csv (pre celkový prehľad)
+    write_deal_to_csv(CSV_OUTPUT, row_data)
 
     msg = (
         f"🔔 NOVÝ INZERÁT ({ad['portal']})\n"
@@ -569,6 +596,7 @@ def save_and_notify(ad: dict, ai_info: dict):
         f"📌 Názov: {ad['title']}\n"
         f"💰 Cena: {ad['price_text']}\n"
         f"🤖 AI: {ai_info.get('reason', '')}\n"
+        f"📂 Súbor: {item_csv_path}\n"
         f"🔗 Link: {ad['url']}"
     )
     print("\n" + msg + "\n", flush=True)
@@ -592,7 +620,7 @@ def main():
 
     print(f"Načítaných {len(watchlist)} hľadaných položiek z {WATCHLIST_FILE}:", flush=True)
     for item in watchlist:
-        print(f" - {item}", flush=True)
+        print(f" - {item} -> súbor: {get_item_csv_path(item)}", flush=True)
 
     seen_ads = load_seen_ads()
     collected_ads_by_id = {}
